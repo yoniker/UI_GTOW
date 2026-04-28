@@ -5,6 +5,8 @@ import zlib
 import json
 import os
 
+from poker_evaluator import categorize_combo
+
 app = FastAPI(title="GTO Wizard Local Bridge")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -20,7 +22,7 @@ def get_combo_from_idx(idx):
         base = (c1 * (c1 - 1)) // 2
         max_idx = base + (c1 - 1)
         if idx <= max_idx:
-            c2 = idx - base  # Moved to its own line!
+            c2 = idx - base
             return DECK[c1], DECK[c2]
     return None, None
 
@@ -37,171 +39,235 @@ def get_active_player_idx(route):
         else: p = 1 - p
     return p
 
-def get_node_id_for_route(tree_id, route, board_len, cursor):
-    """Safely traverses universes to find historical nodes"""
-    search_route = route if route else "Base_Node"
-    current_tree = tree_id
-    while current_tree:
-        cursor.execute("SELECT node_id, board FROM Nodes WHERE tree_id=? AND postflop_route=?", (current_tree, search_route))
-        for r in cursor.fetchall():
-            if len(r['board']) == board_len: return r['node_id']
-        if current_tree == 'base': break
-        cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (current_tree,))
-        pt = cursor.fetchone()
-        current_tree = pt['parent_tree_id'] if pt and pt['parent_tree_id'] else 'base'
-    return None
-
-# --- ENDPOINT 1: THE LINEAGE (Time Machine) ---
+# ==============================================================================
+# 1. THE RELATIONAL LINEAGE TRACER (The Fix)
+# ==============================================================================
 @app.get("/api/lineage/{node_id}")
 def get_node_lineage(node_id: int):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute("SELECT board, postflop_route, tree_id, has_direct_lock FROM Nodes WHERE node_id = ?", (node_id,))
-    node = cursor.fetchone()
-    if not node: return {"timeline": []}
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    board, route, tree_id = node['board'], node['postflop_route'], node['tree_id']
-    timeline = [{"type": "board", "street": "flop", "cards": board[0:6], "node_id": get_node_id_for_route(tree_id, "", 6, cursor)}]
+        # 1. Fetch Target
+        cursor.execute("SELECT board, postflop_route, tree_id, has_direct_lock FROM Nodes WHERE node_id = ?", (node_id,))
+        target = cursor.fetchone()
+        if not target: return {"timeline": []}
 
-    actions = route.split('-') if route and route != "Base_Node" else []
-    current_player, current_street_idx, route_so_far = "BB", 0, ""
+        # 2. Build Ancestry Chain (Walk backwards up GameTrees)
+        ancestry = []
+        current_tid = target['tree_id']
+        while current_tid:
+            ancestry.insert(0, current_tid) # Insert at front to order chronologically
+            if current_tid == 'base': break
+            cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (current_tid,))
+            parent = cursor.fetchone()
+            current_tid = parent['parent_tree_id'] if parent and parent['parent_tree_id'] else 'base'
 
-    for act in actions:
-        step_node_id = get_node_id_for_route(tree_id, route_so_far, 6 + (current_street_idx * 2), cursor)
-        timeline.append({"type": "action", "player": current_player, "action": act, "node_id": step_node_id})
-        route_so_far = f"{route_so_far}-{act}" if route_so_far else act
-            
-        if act == 'C' or (act == 'X' and current_player == 'BTN'):
-            current_street_idx += 1
-            current_player = "BB"
-            if current_street_idx == 1 and len(board) >= 8: timeline.append({"type": "board", "street": "turn", "cards": board[6:8], "node_id": get_node_id_for_route(tree_id, route_so_far, 8, cursor)})
-            elif current_street_idx == 2 and len(board) >= 10: timeline.append({"type": "board", "street": "river", "cards": board[8:10], "node_id": get_node_id_for_route(tree_id, route_so_far, 10, cursor)})
-            continue
-        current_player = "BTN" if current_player == "BB" else "BB"
+        # Helper: Find the deepest valid node in our ancestry for a given route/board
+        def get_historical_node(board, route):
+            for tid in reversed(ancestry): # Start from deepest target tree, walk backwards to base
+                cursor.execute("SELECT node_id, tree_id, has_direct_lock FROM Nodes WHERE board=? AND postflop_route=? AND tree_id=?", (board, route, tid))
+                row = cursor.fetchone()
+                if row: return dict(row)
+            return None
 
-    timeline.append({"type": "active_node", "player": current_player, "has_lock": bool(node['has_direct_lock']), "node_id": node_id})
-    conn.close()
-    return {"timeline": timeline}
+        # 3. Chronological Reconstruction
+        timeline = []
+        streets = ["flop", "turn", "river"]
+        current_street_idx = 0
+        current_board = target['board'][:6]
+        route_so_far = "Base_Node"
+        current_player = "BB"
+        last_used_tree = None
 
-# --- ENDPOINT 2: THE RADAR (Worlds vs. Locks) ---
+        # Handle Flop Entry (Base Node)
+        base_node = get_historical_node(current_board, route_so_far)
+        if base_node:
+            last_used_tree = base_node['tree_id']
+            timeline.append({"type": "board", "street": streets[current_street_idx], "cards": current_board, "node_id": base_node['node_id']})
+
+        # Step through actions
+        actions = target['postflop_route'].split('-') if target['postflop_route'] and target['postflop_route'] != "Base_Node" else []
+        
+        for act in actions:
+            decision_node = get_historical_node(current_board, route_so_far)
+
+            if decision_node:
+                # TRAP: Did the tree change? If yes, inject a Meta Node!
+                if last_used_tree and decision_node['tree_id'] != last_used_tree:
+                    action_name = "Nodelock Applied" if decision_node['has_direct_lock'] else f"World: {decision_node['tree_id']}"
+                    timeline.append({"type": "meta", "action": action_name, "street": streets[current_street_idx], "node_id": decision_node['node_id']})
+                last_used_tree = decision_node['tree_id']
+
+                timeline.append({"type": "action", "street": streets[current_street_idx], "player": current_player, "action": act, "node_id": decision_node['node_id']})
+
+            # Advance state
+            route_so_far = act if route_so_far == "Base_Node" else f"{route_so_far}-{act}"
+
+            if act == 'C' or (act == 'X' and current_player == 'BTN'):
+                current_street_idx += 1
+                current_player = "BB"
+                if current_street_idx == 1 and len(target['board']) >= 8:
+                    current_board = target['board'][:8]
+                    board_node = get_historical_node(current_board, route_so_far)
+                    if board_node: timeline.append({"type": "board", "street": "turn", "cards": current_board[6:8], "node_id": board_node['node_id']})
+                elif current_street_idx == 2 and len(target['board']) >= 10:
+                    current_board = target['board'][:10]
+                    board_node = get_historical_node(current_board, route_so_far)
+                    if board_node: timeline.append({"type": "board", "street": "river", "cards": current_board[8:10], "node_id": board_node['node_id']})
+                continue
+
+            current_player = "BTN" if current_player == "BB" else "BB"
+
+        # 4. Append the Active Node (Frontier)
+        timeline.append({"type": "active_node", "street": streets[current_street_idx], "player": current_player, "has_lock": bool(target['has_direct_lock']), "node_id": node_id})
+
+        return {"timeline": timeline}
+
+
+# ==============================================================================
+# 2. NAVIGATION (Unchanged)
+# ==============================================================================
+# ==============================================================================
+# 2. NAVIGATION (The Robust Sync Fix)
+# ==============================================================================
 @app.get("/api/navigation/{node_id}")
 def get_navigation(node_id: int):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute("SELECT board, postflop_route, tree_id, matrix_json FROM Nodes WHERE node_id = ?", (node_id,))
-    node = cursor.fetchone()
-    if not node: return {}
-
-    board, route, current_tree = node['board'], node['postflop_route'], node['tree_id']
-    active_player_name = "BTN" if get_active_player_idx(route) == 1 else "BB"
-
-    # 1. Fetch Parallel Universes
-    cursor.execute("""
-        SELECT n.node_id, n.tree_id, n.has_direct_lock, n.matrix_json, g.parent_tree_id 
-        FROM Nodes n JOIN GameTrees g ON n.tree_id = g.tree_id 
-        WHERE n.board = ? AND n.postflop_route = ?
-    """, (board, route))
-    parallel_nodes = cursor.fetchall()
-
-    raw_worlds, strategy_locks = [], []
-    
-    # FIX: Explicitly find the un-locked node in this world to serve as the Default Strategy
-    default_node_id = next((r['node_id'] for r in parallel_nodes if not r['has_direct_lock']), node_id)
-    
-    for r in parallel_nodes:
-        # Parse Actions to generate a readable World Name
-        mat = json.loads(zlib.decompress(r['matrix_json']).decode('utf-8'))
-        codes = [a.get('action', {}).get('code') for a in mat.get('action_solutions', []) if a.get('action', {}).get('code')]
-        clean_codes = [c if c != 'X' else 'Check' for c in codes]
-        code_str = ", ".join(clean_codes)
-
-        raw_worlds.append({
-            "node_id": r['node_id'], 
-            "codes": code_str, 
-            "name": f"{active_player_name} World: [{code_str}]"
-        })
-
-        if r['has_direct_lock']:
-            strategy_locks.append({"node_id": r['node_id'], "name": f"Nodelocked ({r['tree_id'][:4]})"})
-
-    # Deduplicate Worlds (We only care about structurally distinct options)
-    unique_worlds, seen_codes = [], set()
-    for w in raw_worlds:
-        if w['codes'] not in seen_codes:
-            unique_worlds.append(w); seen_codes.add(w['codes'])
-
-    if strategy_locks:
-        # Guarantee distinct IDs to prevent React from snapping back
-        strategy_locks.insert(0, {"node_id": default_node_id, "name": "Default Strategy"})
-
-    # 2. Forward Actions (Buttons)
-    matrix = json.loads(zlib.decompress(node['matrix_json']).decode('utf-8'))
-    lineage = []
-    tid = current_tree
-    while tid:
-        lineage.append(tid)
-        cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (tid,))
-        pt = cursor.fetchone()
-        tid = pt['parent_tree_id'] if pt and pt['parent_tree_id'] != 'base' else None
-
-    children = []
-    for sol in matrix.get('action_solutions', []):
-        act_code = sol.get('action', {}).get('code')
-        if not act_code: continue
-        child_route = f"{route}-{act_code}" if route and route != "Base_Node" else act_code
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
         
-        placeholders = ','.join(['?'] * len(lineage))
-        cursor.execute(f"SELECT node_id FROM Nodes WHERE postflop_route = ? AND tree_id IN ({placeholders}) LIMIT 1", [child_route] + lineage)
-        child_row = cursor.fetchone()
-        children.append({"action": act_code, "node_id": child_row['node_id'] if child_row else None})
+        cursor.execute("SELECT board, postflop_route, tree_id, matrix_json FROM Nodes WHERE node_id = ?", (node_id,))
+        node = cursor.fetchone()
+        if not node: return {}
 
-    conn.close()
-    return {"worlds": unique_worlds, "strategy_locks": strategy_locks, "children": children}
+        board, route, current_tree = node['board'], node['postflop_route'], node['tree_id']
+        active_player_name = "BTN" if get_active_player_idx(route) == 1 else "BB"
 
-# --- ENDPOINT 3: THE GRID ---
+        cursor.execute("SELECT node_id, tree_id, has_direct_lock, matrix_json FROM Nodes WHERE board = ? AND postflop_route = ?", (board, route))
+        parallel_nodes = cursor.fetchall()
+
+        raw_worlds, strategy_locks = [], []
+        
+        # 1. Strictly identify the root Structural Node for the exact state we are in
+        default_node_id = next((r['node_id'] for r in parallel_nodes if not r['has_direct_lock'] and r['tree_id'] == current_tree), None)
+        if not default_node_id:
+            default_node_id = next((r['node_id'] for r in parallel_nodes if not r['has_direct_lock']), node_id)
+        
+        for r in parallel_nodes:
+            if r['has_direct_lock']:
+                strategy_locks.append({"node_id": r['node_id'], "name": f"Nodelocked ({r['tree_id'][:4]})"})
+            else:
+                mat = json.loads(zlib.decompress(r['matrix_json']).decode('utf-8'))
+                clean_codes = [c.get('action', {}).get('code', 'X') for c in mat.get('action_solutions', [])]
+                code_str = ", ".join([c if c != 'X' else 'Check' for c in clean_codes])
+                raw_worlds.append({"node_id": r['node_id'], "tree_id": r['tree_id'], "codes": code_str, "name": f"{active_player_name} World: [{code_str}]"})
+
+        unique_worlds, seen_codes = [], set()
+        
+        # 🔥 THE FIX: Guarantee the current active structural world is injected FIRST
+        active_world = next((w for w in raw_worlds if w['node_id'] == default_node_id), None)
+        if active_world:
+            unique_worlds.append(active_world)
+            seen_codes.add(active_world['codes'])
+            
+        for w in raw_worlds:
+            if w['codes'] not in seen_codes: 
+                unique_worlds.append(w)
+                seen_codes.add(w['codes'])
+
+        if strategy_locks: strategy_locks.insert(0, {"node_id": default_node_id, "name": "Default Strategy"})
+
+        matrix = json.loads(zlib.decompress(node['matrix_json']).decode('utf-8'))
+        
+        tree_lineage = []
+        tid = current_tree
+        while tid:
+            if tid not in tree_lineage: tree_lineage.append(tid)
+            if tid == 'base': break 
+            cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (tid,))
+            pt = cursor.fetchone()
+            tid = pt['parent_tree_id'] if pt and pt['parent_tree_id'] else 'base'
+
+        children = []
+        for sol in matrix.get('action_solutions', []):
+            act_code = sol.get('action', {}).get('code')
+            if not act_code: continue
+            
+            child_route = f"{route}-{act_code}" if route and route != "Base_Node" else act_code
+            placeholders = ','.join(['?'] * len(tree_lineage))
+            cursor.execute(f"SELECT node_id FROM Nodes WHERE postflop_route = ? AND tree_id IN ({placeholders}) LIMIT 1", [child_route] + tree_lineage)
+            child_row = cursor.fetchone()
+            
+            children.append({"action": act_code, "node_id": child_row['node_id'] if child_row else None})
+
+        return {"worlds": unique_worlds, "strategy_locks": strategy_locks, "children": children}
+
+# ==============================================================================
+# 3. THE GRID (Unchanged)
+# ==============================================================================
 @app.get("/api/node/{node_id}/player/{player_idx}")
 def get_node_matrix(node_id: int, player_idx: int = 0):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute("SELECT matrix_json FROM Nodes WHERE node_id = ?", (node_id,))
-    row = cursor.fetchone(); conn.close()
-    if not row: raise HTTPException(status_code=404)
-
-    matrix_data = json.loads(zlib.decompress(row['matrix_json']).decode('utf-8'))
-    player_data = matrix_data.get('players_info', [])[player_idx]
-    action_sols, ranges, hand_eqs = matrix_data.get('action_solutions', []), player_data.get('range', []), player_data.get('hand_eqs', [])
-    
-    grid = { (r1+r2 if r1==r2 else r1+r2+'s' if RANKS.index(r1)>RANKS.index(r2) else r2+r1+'o'): {"cell_name": r1+r2 if r1==r2 else r1+r2+'s' if RANKS.index(r1)>RANKS.index(r2) else r2+r1+'o', "total_weight": 0.0, "actions": {}, "combos": []} for r1 in reversed(RANKS) for r2 in reversed(RANKS) }
-
-    for i in range(1326):
-        weight = ranges[i] if i < len(ranges) else 0.0
-        if weight <= 0: continue
-        c1, c2 = get_combo_from_idx(i)
-        if not c1: continue
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
         
-        cell = grid[get_grid_key(c1, c2)]
-        cell["total_weight"] += weight
-        combo_detail = { "cards": c1 + c2, "weight": weight, "equity": (hand_eqs[i]*100 if i<len(hand_eqs) else 0.0), "actions": {} }
+        cursor.execute("SELECT board, matrix_json FROM Nodes WHERE node_id = ?", (node_id,))
+        row = cursor.fetchone()
+        if not row: raise HTTPException(status_code=404)
 
-        for act in action_sols:
-            act_code = act.get('action', {}).get('code', 'Unknown')
-            strat = (act.get('strategy', [])[i] * 100) if i < len(act.get('strategy', [])) else 0.0
-            ev = act.get('evs', [])[i] if i < len(act.get('evs', [])) else 0.0
+        board_cards = [row['board'][i:i+2] for i in range(0, len(row['board']), 2)] if row['board'] else []
+        matrix_data = json.loads(zlib.decompress(row['matrix_json']).decode('utf-8'))
+        player_data = matrix_data.get('players_info', [])[player_idx]
+        action_sols = matrix_data.get('action_solutions', [])
+        ranges = player_data.get('range', [])
+        hand_eqs = player_data.get('hand_eqs', [])
+        
+        grid = { (r1+r2 if r1==r2 else r1+r2+'s' if RANKS.index(r1)>RANKS.index(r2) else r2+r1+'o'): {
+            "cell_name": r1+r2 if r1==r2 else r1+r2+'s' if RANKS.index(r1)>RANKS.index(r2) else r2+r1+'o', 
+            "total_weight": 0.0, "actions": {}, "combos": []
+        } for r1 in reversed(RANKS) for r2 in reversed(RANKS) }
+
+        for i in range(1326):
+            weight = ranges[i] if i < len(ranges) else 0.0
+            if weight <= 0: continue
             
-            if act_code not in cell["actions"]: cell["actions"][act_code] = {"strat_sum": 0.0, "ev_sum": 0.0}
-            cell["actions"][act_code]["strat_sum"] += strat * weight
-            cell["actions"][act_code]["ev_sum"] += ev * weight
-            combo_detail["actions"][act_code] = { "strategy": strat, "ev": ev }
-        cell["combos"].append(combo_detail)
+            c1, c2 = get_combo_from_idx(i)
+            if not c1: continue
+            
+            cell = grid[get_grid_key(c1, c2)]
+            cell["total_weight"] += weight
+            eq = hand_eqs[i] if i < len(hand_eqs) else 0.0
+            
+            tags = categorize_combo(c1, c2, board_cards, eq)
+            combo_detail = { "cards": c1 + c2, "weight": weight, "equity": eq * 100, "tags": tags, "actions": {} }
 
-    final_grid = []
-    for key, cell in grid.items():
-        w = cell["total_weight"]
-        if w > 0:
-            for act_code, sums in cell["actions"].items(): cell["actions"][act_code] = { "strategy": sums["strat_sum"] / w, "ev": sums["ev_sum"] / w }
-        else:
-            for act_code in cell["actions"].keys(): cell["actions"][act_code] = {"strategy": 0.0, "ev": 0.0}
-        cell["equity"] = max(cell["combos"], key=lambda c: c["equity"], default={"equity": 0})["equity"]
-        final_grid.append(cell)
+            for act in action_sols:
+                act_code = act.get('action', {}).get('code', 'Unknown')
+                strat = (act.get('strategy', [])[i] * 100) if i < len(act.get('strategy', [])) else 0.0
+                ev = act.get('evs', [])[i] if i < len(act.get('evs', [])) else 0.0
+                
+                if act_code not in cell["actions"]: cell["actions"][act_code] = {"strat_sum": 0.0, "ev_sum": 0.0}
+                cell["actions"][act_code]["strat_sum"] += strat * weight
+                cell["actions"][act_code]["ev_sum"] += ev * weight
+                combo_detail["actions"][act_code] = { "strategy": strat, "ev": ev }
+                
+            cell["combos"].append(combo_detail)
 
-    return { "node_id": node_id, "grid": final_grid }
+        final_grid = []
+        for key, cell in grid.items():
+            w = cell["total_weight"]
+            if w > 0:
+                for act_code, sums in cell["actions"].items(): 
+                    cell["actions"][act_code] = { "strategy": sums["strat_sum"] / w, "ev": sums["ev_sum"] / w }
+            else:
+                for act_code in cell["actions"].keys(): 
+                    cell["actions"][act_code] = {"strategy": 0.0, "ev": 0.0}
+                    
+            cell["equity"] = max(cell["combos"], key=lambda c: c["equity"], default={"equity": 0})["equity"]
+            final_grid.append(cell)
+
+        return { "node_id": node_id, "grid": final_grid }
 
 if __name__ == "__main__":
     import uvicorn

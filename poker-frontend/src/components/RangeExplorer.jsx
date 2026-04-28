@@ -14,7 +14,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
 
   const activeFilter = lockedFilter || hoveredFilter;
 
-  // 1. Reset local state when the user navigates to a new node or switches players
   useEffect(() => {
     setLockedCell(null);
     setHoveredCell(null);
@@ -22,7 +21,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
     setHoveredFilter(null);
   }, [viewedNodeId, activePlayer]);
 
-  // 2. Fetch the actual matrix data
   useEffect(() => {
     if (viewedNodeId) {
       fetch(`http://127.0.0.1:8000/api/node/${viewedNodeId}/player/${activePlayer}`)
@@ -32,7 +30,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
     }
   }, [viewedNodeId, activePlayer]);
 
-  // 3. The Math Engine (Handles Filtering, Global Frequencies, and the Report Buckets)
   const { filteredData, globalFreqs, totalCombos, reportBuckets } = useMemo(() => {
     let tCombos = 0;
     const actSums = {};
@@ -55,14 +52,12 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
           tCombos += weight;
           newTotalWeight += weight;
           Object.entries(combo.actions).forEach(([act, d]) => {
-            // Safely handle both flat numbers and { strategy, ev } objects
             const strat = typeof d === 'number' ? d : (d.strategy || 0);
             actSums[act] = (actSums[act] || 0) + (strat / 100) * weight;
             newActions[act] = (newActions[act] || 0) + (strat / 100) * weight;
           });
         }
 
-        // Populate Report Categories
         if (combo.weight > 0 && combo.tags) {
           Object.keys(buckets).forEach(type => {
             const val = combo.tags[type];
@@ -78,7 +73,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
         return { ...combo, weight };
       });
 
-      // Recalculate cell percentages based on the active filter
       const normalizedActions = {};
       if (newTotalWeight > 0) {
         Object.keys(newActions).forEach(act => {
@@ -97,7 +91,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
 
   const sortedActions = Object.keys(globalFreqs).sort((a, b) => ["R", "B", "X", "C", "F"].indexOf(a[0]) - ["R", "B", "X", "C", "F"].indexOf(b[0]));
 
-  // 4. Bulletproof Gradient Generator
   const getBackgroundGraph = (actions, total) => {
     if (total === 0 || !actions || Object.keys(actions).length === 0) return { backgroundColor: '#222' };
     let cum = 0; const grads = [];
@@ -118,7 +111,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '20px' }}>
       
-      {/* --- TOP CONTROLS --- */}
       <div style={{ display: 'flex', justifyContent: 'space-between', width: '1060px', marginBottom: '12px' }}>
         <div style={{ display: 'flex', gap: '8px' }}>
           <button onClick={() => setLayoutMode('Grid')} style={{ padding: '6px 16px', backgroundColor: layoutMode === 'Grid' ? '#444' : '#222', color: 'white', border: '1px solid #555', borderRadius: '4px', cursor: 'pointer' }}>Grid View</button>
@@ -133,7 +125,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
 
       <div style={{ display: 'flex', gap: '30px' }}>
         
-        {/* --- LEFT PANEL: GRID OR REPORT --- */}
         <div style={{ width: '600px', height: '600px', backgroundColor: '#161616', borderRadius: '8px', overflowY: 'auto' }}>
           
           {layoutMode === 'Grid' ? (
@@ -150,12 +141,32 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
                     onMouseLeave={() => setHoveredCell(null)}
                     onClick={() => setLockedCell(lockedCell?.cell_name === cell.cell_name ? null : cell)}
                     style={{ 
+                      position: 'relative',
+                      overflow: 'hidden',
                       height: '45px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: 'bold', color: 'white', cursor: 'pointer',
                       opacity: isDimmed ? 0.2 : 1, border: lockedCell?.cell_name === cell.cell_name ? '2px solid white' : 'none',
                       ...getBackgroundGraph(cell.actions, 100)
                     }}>
-                    <span style={{ textShadow: '0 1px 2px black', zIndex: 2 }}>{displayValue}</span>
-                    {viewMode !== 'Strategy' && <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '9px', color: '#ccc', zIndex: 1 }}>{cell.cell_name}</span>}
+                    
+                    {viewMode !== 'Strategy' && (
+                      <span style={{ 
+                        position: 'absolute', top: '2px', left: '3px', 
+                        fontSize: '10px', color: 'white', 
+                        zIndex: 1, pointerEvents: 'none', lineHeight: 1,
+                        textShadow: '1px 1px 2px black, -1px -1px 2px black, 0 0 4px black'
+                      }}>
+                        {cell.cell_name}
+                      </span>
+                    )}
+
+                    <span style={{ 
+                        color: 'white',
+                        textShadow: '1px 1px 2px black, -1px -1px 2px black, 0 0 5px black', 
+                        zIndex: 2, pointerEvents: 'none', 
+                        fontSize: viewMode === 'Strategy' ? '11px' : '10px' 
+                    }}>
+                      {displayValue}
+                    </span>
                   </div>
                 );
               })}
@@ -189,7 +200,6 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
           )}
         </div>
 
-        {/* --- RIGHT PANEL: STATS & CELL BREAKDOWN --- */}
         <div style={{ width: '400px', backgroundColor: '#1e1e1e', borderRadius: '8px', padding: '16px', border: '1px solid #333', overflowY: 'auto' }}>
           
           <h4 style={{ color: '#888', marginBottom: '15px', textTransform: 'uppercase', fontSize: '12px' }}>
@@ -228,9 +238,24 @@ export default function RangeExplorer({ viewedNodeId, activePlayer }) {
                   const cSorted = Object.keys(combo.actions).sort((a, b) => ["R", "B", "X", "C", "F"].indexOf(a[0]) - ["R", "B", "X", "C", "F"].indexOf(b[0]));
                   return (
                     <div key={i} style={{ ...getBackgroundGraph(combo.actions, 100), padding: '6px', borderRadius: '4px', border: '1px solid #444' }}>
-                      <div style={{ display: 'flex', gap: '2px', marginBottom: '4px' }}>
-                        {renderCard(combo.cards.substring(0,2), "10px")}
-                        {renderCard(combo.cards.substring(2,4), "10px")}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                        <div style={{ display: 'flex', gap: '2px' }}>
+                            {renderCard(combo.cards.substring(0,2), "10px")}
+                            {renderCard(combo.cards.substring(2,4), "10px")}
+                        </div>
+                        {/* 🔥 SHOW EQUITY OR EV HERE IN RIGHT PANEL */}
+                        {viewMode !== 'Strategy' && (
+                            <span style={{ 
+                                fontSize: '10px', 
+                                color: 'white', 
+                                fontWeight: 'bold',
+                                textShadow: '1px 1px 2px black, -1px -1px 2px black, 0 0 4px black' 
+                            }}>
+                                {viewMode === 'Equity' 
+                                    ? `${(combo.equity || 0).toFixed(1)}%` 
+                                    : Math.max(0, ...Object.values(combo.actions).map(a => a.ev || 0)).toFixed(2)}
+                            </span>
+                        )}
                       </div>
                       {viewMode === 'Strategy' && cSorted.map(act => {
                         const strat = typeof combo.actions[act] === 'number' ? combo.actions[act] : (combo.actions[act].strategy || 0);

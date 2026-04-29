@@ -4,6 +4,7 @@ import sqlite3
 import zlib
 import json
 import os
+import re
 
 from poker_evaluator import categorize_combo
 
@@ -39,8 +40,56 @@ def get_active_player_idx(route):
         else: p = 1 - p
     return p
 
+# --- POSITIONS EXTRACTOR & NORMALIZER ---
+def normalize_position(pos_str):
+    """Aggressively scrubs a position string to a clean, standardized format."""
+    clean = str(pos_str).upper()
+    clean = re.sub(r'[^A-Z0-9]', '', clean)
+    
+    aliases = {
+        'BTN': 'BU',
+        'BUTTON': 'BU',
+        'BIGBLIND': 'BB',
+        'SMALLBLIND': 'SB',
+        'STRADDLE': 'STR'
+    }
+    return aliases.get(clean, clean)
+
+def extract_positions_from_matrix(matrix_data):
+    """Extracts exact positional matchup and applies normalization."""
+    try:
+        actions = matrix_data.get('action_solutions', [])
+        if not actions: 
+            return "BB", "BU"
+            
+        raw_pos = actions[0].get('action', {}).get('position', 'BB')
+        raw_next = actions[0].get('action', {}).get('next_position', 'BU')
+
+        norm_pos = normalize_position(raw_pos)
+        norm_next = normalize_position(raw_next)
+
+        order = [
+            'OOP', 'SB', 'BB', 'STR', 
+            'UTG', 'EP', 'UTG1', 'UTG2', 'UTG3', 
+            'MP', 'MP1', 'MP2', 'MP3', 
+            'LJ', 'HJ', 'CO', 'BU', 'IP'
+        ]
+        
+        pos_idx = order.index(norm_pos) if norm_pos in order else 99
+        next_idx = order.index(norm_next) if norm_next in order else 99
+
+        if pos_idx < next_idx:
+            return norm_pos, norm_next  
+        else:
+            return norm_next, norm_pos  
+            
+    except Exception as e:
+        print(f"Error extracting positions: {e}")
+        return "BB", "BU"
+
+
 # ==============================================================================
-# 1. THE RELATIONAL LINEAGE TRACER (The Fix)
+# 1. THE RELATIONAL LINEAGE TRACER
 # ==============================================================================
 @app.get("/api/lineage/{node_id}")
 def get_node_lineage(node_id: int):
@@ -48,52 +97,50 @@ def get_node_lineage(node_id: int):
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # 1. Fetch Target
-        cursor.execute("SELECT board, postflop_route, tree_id, has_direct_lock FROM Nodes WHERE node_id = ?", (node_id,))
+        cursor.execute("SELECT board, postflop_route, tree_id, has_direct_lock, matrix_json FROM Nodes WHERE node_id = ?", (node_id,))
         target = cursor.fetchone()
         if not target: return {"timeline": []}
 
-        # 2. Build Ancestry Chain (Walk backwards up GameTrees)
+        p0, p1 = "BB", "BU"
+        if target['matrix_json']:
+            mat = json.loads(zlib.decompress(target['matrix_json']).decode('utf-8'))
+            p0, p1 = extract_positions_from_matrix(mat)
+
         ancestry = []
         current_tid = target['tree_id']
         while current_tid:
-            ancestry.insert(0, current_tid) # Insert at front to order chronologically
+            ancestry.insert(0, current_tid) 
             if current_tid == 'base': break
             cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (current_tid,))
             parent = cursor.fetchone()
             current_tid = parent['parent_tree_id'] if parent and parent['parent_tree_id'] else 'base'
 
-        # Helper: Find the deepest valid node in our ancestry for a given route/board
         def get_historical_node(board, route):
-            for tid in reversed(ancestry): # Start from deepest target tree, walk backwards to base
+            for tid in reversed(ancestry): 
                 cursor.execute("SELECT node_id, tree_id, has_direct_lock FROM Nodes WHERE board=? AND postflop_route=? AND tree_id=?", (board, route, tid))
                 row = cursor.fetchone()
                 if row: return dict(row)
             return None
 
-        # 3. Chronological Reconstruction
         timeline = []
         streets = ["flop", "turn", "river"]
         current_street_idx = 0
         current_board = target['board'][:6]
         route_so_far = "Base_Node"
-        current_player = "BB"
+        current_player = p0  
         last_used_tree = None
 
-        # Handle Flop Entry (Base Node)
         base_node = get_historical_node(current_board, route_so_far)
         if base_node:
             last_used_tree = base_node['tree_id']
             timeline.append({"type": "board", "street": streets[current_street_idx], "cards": current_board, "node_id": base_node['node_id']})
 
-        # Step through actions
         actions = target['postflop_route'].split('-') if target['postflop_route'] and target['postflop_route'] != "Base_Node" else []
         
         for act in actions:
             decision_node = get_historical_node(current_board, route_so_far)
 
             if decision_node:
-                # TRAP: Did the tree change? If yes, inject a Meta Node!
                 if last_used_tree and decision_node['tree_id'] != last_used_tree:
                     action_name = "Nodelock Applied" if decision_node['has_direct_lock'] else f"World: {decision_node['tree_id']}"
                     timeline.append({"type": "meta", "action": action_name, "street": streets[current_street_idx], "node_id": decision_node['node_id']})
@@ -101,12 +148,11 @@ def get_node_lineage(node_id: int):
 
                 timeline.append({"type": "action", "street": streets[current_street_idx], "player": current_player, "action": act, "node_id": decision_node['node_id']})
 
-            # Advance state
             route_so_far = act if route_so_far == "Base_Node" else f"{route_so_far}-{act}"
 
-            if act == 'C' or (act == 'X' and current_player == 'BTN'):
+            if act == 'C' or (act == 'X' and current_player == p1):
                 current_street_idx += 1
-                current_player = "BB"
+                current_player = p0
                 if current_street_idx == 1 and len(target['board']) >= 8:
                     current_board = target['board'][:8]
                     board_node = get_historical_node(current_board, route_so_far)
@@ -117,19 +163,15 @@ def get_node_lineage(node_id: int):
                     if board_node: timeline.append({"type": "board", "street": "river", "cards": current_board[8:10], "node_id": board_node['node_id']})
                 continue
 
-            current_player = "BTN" if current_player == "BB" else "BB"
+            current_player = p1 if current_player == p0 else p0
 
-        # 4. Append the Active Node (Frontier)
         timeline.append({"type": "active_node", "street": streets[current_street_idx], "player": current_player, "has_lock": bool(target['has_direct_lock']), "node_id": node_id})
 
         return {"timeline": timeline}
 
 
 # ==============================================================================
-# 2. NAVIGATION (Unchanged)
-# ==============================================================================
-# ==============================================================================
-# 2. NAVIGATION (The Robust Sync Fix)
+# 2. NAVIGATION & FUZZY MATCHING
 # ==============================================================================
 @app.get("/api/navigation/{node_id}")
 def get_navigation(node_id: int):
@@ -142,14 +184,15 @@ def get_navigation(node_id: int):
         if not node: return {}
 
         board, route, current_tree = node['board'], node['postflop_route'], node['tree_id']
-        active_player_name = "BTN" if get_active_player_idx(route) == 1 else "BB"
+        
+        matrix = json.loads(zlib.decompress(node['matrix_json']).decode('utf-8'))
+        p0, p1 = extract_positions_from_matrix(matrix)
+        active_player_name = p1 if get_active_player_idx(route) == 1 else p0
 
         cursor.execute("SELECT node_id, tree_id, has_direct_lock, matrix_json FROM Nodes WHERE board = ? AND postflop_route = ?", (board, route))
         parallel_nodes = cursor.fetchall()
 
         raw_worlds, strategy_locks = [], []
-        
-        # 1. Strictly identify the root Structural Node for the exact state we are in
         default_node_id = next((r['node_id'] for r in parallel_nodes if not r['has_direct_lock'] and r['tree_id'] == current_tree), None)
         if not default_node_id:
             default_node_id = next((r['node_id'] for r in parallel_nodes if not r['has_direct_lock']), node_id)
@@ -164,8 +207,6 @@ def get_navigation(node_id: int):
                 raw_worlds.append({"node_id": r['node_id'], "tree_id": r['tree_id'], "codes": code_str, "name": f"{active_player_name} World: [{code_str}]"})
 
         unique_worlds, seen_codes = [], set()
-        
-        # 🔥 THE FIX: Guarantee the current active structural world is injected FIRST
         active_world = next((w for w in raw_worlds if w['node_id'] == default_node_id), None)
         if active_world:
             unique_worlds.append(active_world)
@@ -177,34 +218,40 @@ def get_navigation(node_id: int):
                 seen_codes.add(w['codes'])
 
         if strategy_locks: strategy_locks.insert(0, {"node_id": default_node_id, "name": "Default Strategy"})
-
-        matrix = json.loads(zlib.decompress(node['matrix_json']).decode('utf-8'))
         
-        tree_lineage = []
-        tid = current_tree
-        while tid:
-            if tid not in tree_lineage: tree_lineage.append(tid)
-            if tid == 'base': break 
-            cursor.execute("SELECT parent_tree_id FROM GameTrees WHERE tree_id=?", (tid,))
-            pt = cursor.fetchone()
-            tid = pt['parent_tree_id'] if pt and pt['parent_tree_id'] else 'base'
-
         children = []
         for sol in matrix.get('action_solutions', []):
             act_code = sol.get('action', {}).get('code')
             if not act_code: continue
             
-            child_route = f"{route}-{act_code}" if route and route != "Base_Node" else act_code
-            placeholders = ','.join(['?'] * len(tree_lineage))
-            cursor.execute(f"SELECT node_id FROM Nodes WHERE postflop_route = ? AND tree_id IN ({placeholders}) LIMIT 1", [child_route] + tree_lineage)
-            child_row = cursor.fetchone()
+            matched_node_id = None
             
-            children.append({"action": act_code, "node_id": child_row['node_id'] if child_row else None})
+            if act_code in ['X', 'C', 'F']:
+                child_route = f"{route}-{act_code}" if route and route != "Base_Node" else act_code
+                cursor.execute("SELECT node_id FROM Nodes WHERE postflop_route = ? AND board LIKE ? LIMIT 1", (child_route, f"{board}%"))
+                child_row = cursor.fetchone()
+                if child_row: matched_node_id = child_row['node_id']
+            else:
+                prefix_route = f"{route}-" if route and route != "Base_Node" else ""
+                search_prefix = f"{prefix_route}{act_code[0]}%"
+                
+                cursor.execute("SELECT node_id, postflop_route FROM Nodes WHERE postflop_route LIKE ? AND board LIKE ?", (search_prefix, f"{board}%"))
+                candidates = cursor.fetchall()
+                
+                for cand in candidates:
+                    cand_action = cand['postflop_route'].split('-')[-1]
+                    if cand_action.startswith(act_code[0]):
+                        if act_code in cand_action:
+                            matched_node_id = cand['node_id']
+                            break
+                            
+            children.append({"action": act_code, "node_id": matched_node_id})
 
         return {"worlds": unique_worlds, "strategy_locks": strategy_locks, "children": children}
 
+
 # ==============================================================================
-# 3. THE GRID (Unchanged)
+# 3. THE GRID MATH (NESTED PLAYER DICTIONARY FIX)
 # ==============================================================================
 @app.get("/api/node/{node_id}/player/{player_idx}")
 def get_node_matrix(node_id: int, player_idx: int = 0):
@@ -218,7 +265,28 @@ def get_node_matrix(node_id: int, player_idx: int = 0):
 
         board_cards = [row['board'][i:i+2] for i in range(0, len(row['board']), 2)] if row['board'] else []
         matrix_data = json.loads(zlib.decompress(row['matrix_json']).decode('utf-8'))
-        player_data = matrix_data.get('players_info', [])[player_idx]
+        
+        players_info = matrix_data.get('players_info', [])
+        if len(players_info) == 2:
+            # 🔥 THE FIX: Drilling into the nested 'player' dictionary to extract position
+            p0_pos = normalize_position(players_info[0].get('player', {}).get('position', ''))
+            p1_pos = normalize_position(players_info[1].get('player', {}).get('position', ''))
+            
+            order = [
+                'OOP', 'SB', 'BB', 'STR', 
+                'UTG', 'EP', 'UTG1', 'UTG2', 'UTG3', 
+                'MP', 'MP1', 'MP2', 'MP3', 
+                'LJ', 'HJ', 'CO', 'BU', 'IP'
+            ]
+            
+            i0 = order.index(p0_pos) if p0_pos in order else 99
+            i1 = order.index(p1_pos) if p1_pos in order else 99
+            
+            if i0 > i1:
+                players_info = [players_info[1], players_info[0]]
+                
+        player_data = players_info[player_idx]
+        
         action_sols = matrix_data.get('action_solutions', [])
         ranges = player_data.get('range', [])
         hand_eqs = player_data.get('hand_eqs', [])

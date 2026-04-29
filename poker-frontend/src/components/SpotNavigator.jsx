@@ -28,7 +28,6 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
     return text;
   };
 
-  // 🔥 THE FIX: Physically lock the UI values to the backend guarantees so it never forgets
   const safeWorldValue = navData.worlds?.some(w => w.node_id === activeNodeId) 
     ? activeNodeId 
     : (navData.worlds?.[0]?.node_id || '');
@@ -57,7 +56,6 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
         return (
           <React.Fragment key={step.semantic_id}>
             
-            {/* 1. BOARD NODES */}
             {step.type === 'board' && (
               <div onClick={() => handleNodeClick(step)}
                 style={{
@@ -75,9 +73,6 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
               </div>
             )}
 
-            {/* 2. HISTORICAL META NODES */}
-            {/* 🔥 THE FIX: If this Meta node is sitting immediately before the node we are viewing, hide it! 
-                 The Active node's dropdown will represent both concepts perfectly. */}
             {step.type === 'meta' && processedTimeline[idx + 1]?.semantic_id !== viewedSemanticId && (
               <div onClick={() => handleNodeClick(step)}
                 style={{ 
@@ -111,7 +106,6 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
               </div>
             )}
 
-            {/* 3. COLLAPSED HISTORICAL ACTION NODES */}
             {(step.type === 'action' || step.type === 'active_node') && !isViewed && (hasAction || step.type === 'active_node') && (
               <div onClick={() => handleNodeClick(step)}
                 style={{
@@ -135,7 +129,6 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
               </div>
             )}
 
-            {/* 4. EXPLODED ACTIVE FRONTIER */}
             {(step.type === 'action' || step.type === 'active_node') && isViewed && (
               <div style={{ display: 'flex', gap: '8px', marginLeft: hasAction ? '4px' : '0' }}>
                 
@@ -168,12 +161,39 @@ export default function SpotNavigator({ processedTimeline, playerOOP, playerIP, 
                   
                   {navData.children?.length > 0 ? (
                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', justifyContent: 'center' }}>
-                      {navData.children.map(child => (
-                        <button key={child.action} onClick={(e) => { e.stopPropagation(); child.node_id && onMutateTree(child.node_id); }} 
-                          style={{ backgroundColor: ACTION_COLORS[child.action[0]] || '#444', color: 'white', border: 'none', padding: '6px 10px', borderRadius: '4px', fontSize: '12px', fontWeight: 'bold', cursor: 'pointer' }}>
-                          {child.action === 'X' ? 'Check' : child.action === 'C' ? 'Call' : child.action}
-                        </button>
-                      ))}
+                      
+                      {/* 🔥 THE GREY OUT FIX: Properly disables and greys out missing DB actions */}
+                      {navData.children.map(child => {
+                        const hasNode = !!child.node_id;
+                        return (
+                          <button 
+                            key={child.action} 
+                            onClick={(e) => { 
+                              e.stopPropagation(); 
+                              if (hasNode) {
+                                onMutateTree(child.node_id); 
+                              } else {
+                                console.log(`❌ [DEAD END] Action ${child.action} is not saved in your database.`);
+                              }
+                            }} 
+                            style={{ 
+                              backgroundColor: ACTION_COLORS[child.action[0]] || '#444', 
+                              color: 'white', 
+                              border: 'none', 
+                              padding: '6px 10px', 
+                              borderRadius: '4px', 
+                              fontSize: '12px', 
+                              fontWeight: 'bold', 
+                              cursor: hasNode ? 'pointer' : 'not-allowed',
+                              opacity: hasNode ? 1 : 0.4
+                            }}
+                            title={hasNode ? '' : 'Node not saved in database'}
+                          >
+                            {child.action === 'X' ? 'Check' : child.action === 'C' ? 'Call' : child.action}
+                          </button>
+                        );
+                      })}
+
                     </div>
                   ) : (
                     <div style={{ textAlign: 'center', color: '#aaa', fontSize: '12px', fontStyle: 'italic' }}>
